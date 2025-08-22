@@ -115,10 +115,9 @@ python3 utils_plot.py --bands results_band_dos/mp-149_bs.json
 4. Use `utils_plot.py` to visualize DOS/bands.
 5. Combine all results into screening tables (examples provided in the LaTeX paper).
 
+Citation
+If you use this workflow in your research, please cite the Materials Project and NEMAD databases:
+A. Jain et al., The Materials Project: A materials genome approach to accelerating materials innovation, APL Materials 1, 011002 (2013).
+NEMAD Database: https://nemad.org
 A. Jain *et al.*, **The Materials Project: A materials genome approach to accelerating materials innovation**, *APL Materials* **1**, 011002 (2013).
   NEMAD Database: [https://nemad.org](https://nemad.org)
-
-License: MIT License — free to use, modify, and distribute.
-
-Do you want me to also generate a `requirements.txt` for you with exact pinned versions (e.g. `mp-api==0.41.2`, `pymatgen==2025.x.x`), or keep it unpinned for flexibility?
-```
