@@ -1,0 +1,11 @@
+# Core dependencies
+mp-api==0.41.2
+pymatgen==2025.1.10
+numpy==1.26.4
+pandas==2.2.2
+matplotlib==3.9.2
+tqdm==4.66.5
+requests==2.32.3
+
+# for JSON → plots (phonons, DOS, band structures)
+scipy==1.14.1
