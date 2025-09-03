@@ -1,51 +1,22 @@
-#!/usr/bin/env python3
-"""
-nemad_fetch.py
-
-Query the NEMAD API using formulas and/or element sets derived from your
-MP 'datalist.csv' and save standardized results for downstream merging.
-
-Features
-- Uses exact formula endpoint (/api/<type>/formula) when you pass --by-formula
-- Else uses element search (/api/<type>/search) from each formula's element set
-- Supports database types: magnetic, magnetic_anisotropy, thermoelectric, superconductor
-- Auto handles exact_match, batching, retries, and simple rate limiting
-- Outputs tidy CSV/JSON; optional merged CSV with MP rows
-
-Auth
-- Provide your API key via env var NEMAD_API_KEY or --api-key
-- API base: https://api.nemad.org
-
-Examples
-  export NEMAD_API_KEY=YOUR_KEY
-  # Magnetic by exact formula (best precision):
-  python nemad_fetch.py --types magnetic --by-formula
-
-  # Magnetic + anisotropy by element search, allow supersets, 500/ms backoff:
-  python nemad_fetch.py --types magnetic magnetic_anisotropy --exact-match false --sleep-ms 500
-
-  # Save JSON, Parquet, and a merged CSV with MP columns included:
-  python nemad_fetch.py --types magnetic --by-formula --json --parquet --merge-out nemad_merged_with_mp.csv
-"""
-
 from __future__ import annotations
-import os, sys, time, json, argparse
+import os, sys, re, time, json, argparse
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Any
 
 import pandas as pd
 
+# --- deps ---
 try:
     import requests
 except Exception:
     print("Please `pip install requests pandas`", file=sys.stderr)
     sys.exit(1)
 
-# Optional: better formula handling (recommended)
 try:
     from pymatgen.core.composition import Composition
 except Exception:
     Composition = None
+
 
 BASE_URL = "https://api.nemad.org"
 VALID_TYPES = {"magnetic", "magnetic_anisotropy", "thermoelectric", "superconductor"}
@@ -53,56 +24,121 @@ VALID_TYPES = {"magnetic", "magnetic_anisotropy", "thermoelectric", "superconduc
 
 def read_mp_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
-    if "ID" not in df.columns:
-        raise ValueError("MP CSV must have an 'ID' column.")
-    # choose a composition column
-    comp_col = "compound" if "compound" in df.columns else (
-        "pretty_formula" if "pretty_formula" in df.columns else None
-    )
+    # formula column (prefer reduced/pretty if present to ensure there are no error limitations)
+    comp_col = None
+    for cand in ("compound", "pretty_formula", "formula_pretty", "Composition", "composition"):
+        if cand in df.columns:
+            comp_col = cand
+            break
     if comp_col is None:
-        raise ValueError("MP CSV needs a 'compound' or 'pretty_formula' column.")
-    return df.rename(columns={comp_col: "_mp_formula"})
+        raise ValueError("datalist.csv needs a formula column: one of 'compound', 'pretty_formula', 'formula_pretty'.")
+
+    sg_col = None
+    for cand in ("spacegroup", "space_group", "space_group_symbol", "SpaceGroup", "spg_symbol"):
+        if cand in df.columns:
+            sg_col = cand
+            break
+    if sg_col is None:
+        raise ValueError("datalist.csv needs a space-group symbol column (e.g. 'spacegroup').")
+
+    # keep only what we need...
+    keep = ["ID", comp_col, sg_col]
+    keep = [c for c in keep if c in df.columns]
+    df = df[keep].copy()
+    df = df.rename(columns={comp_col: "_mp_formula", sg_col: "_mp_sg"})
+    return df
 
 
 def canonical_formula(s: str) -> str:
     if not isinstance(s, str) or not s.strip():
         return ""
     if Composition is None:
-        # fallback: return the string as-is
-        return s.strip()
+        # crude fallback: collapse whitespace
+        return re.sub(r"\s+", "", s.strip())
     try:
         return Composition(s).reduced_formula
     except Exception:
-        return s.strip()
+        return re.sub(r"\s+", "", s.strip())
 
 
-def elements_from_formula(s: str) -> List[str]:
-    if Composition is None:
-        # naive fallback: split on capitals
-        import re
-        return sorted(set(re.findall(r"[A-Z][a-z]?", s)))
-    try:
-        comp = Composition(s)
-        return sorted(comp.get_el_amt_dict().keys())
-    except Exception:
-        return []
+_SG_SUBS = {
+    "\u2212": "-",  # minus
+    "\u2011": "-",  # non-breaking hyphen
+    "\u2012": "-",  # figure dash
+    "\u2013": "-",  # en dash
+    "\u2014": "-",  # em dash
+    "\u2010": "-",  # hyphen
+    "\u00AF": "-",  # macron sometimes used in copy/paste
+    " ": "",
+    "_": "",
+}
+
+def _normalize_hyphens(s: str) -> str:
+    for k, v in _SG_SUBS.items():
+        s = s.replace(k, v)
+    return s
+
+def canonical_spacegroup_symbol(s: str) -> str:
+    """Canonicalize SG symbol (string). Examples:
+       'Fm-3m', 'Fm-3m', 'FM-3M', ' f m - 3 m ' -> 'FM-3M'
+    """
+    if not isinstance(s, str):
+        return ""
+    s = s.strip()
+    if not s:
+        return ""
+    s = _normalize_hyphens(s)
+    # Collapse multiple hyphens
+    s = re.sub(r"-{2,}", "-", s)
+    # Remove junk around parentheses
+    s = re.sub(r"\(\s*\d+\s*\)", "", s)  # drop trailing (225) if present
+    # Uppercase letters, keep digits and '-' and '/'
+    # Remove stray dots that sometimes appear
+    s = re.sub(r"[.\s]", "", s).upper()
+    return s
+
+def extract_sg_symbol_from_nemad(rec: Dict[str, Any]) -> str:
+    """
+    Try several common fields. If a field contains 'Fm-3m (225)' or similar,
+    take the symbol-like prefix.
+    """
+    candidates = []
+    for key in ("Space_Group", "SpaceGroup", "space_group", "Crystal_Structure", "crystal_structure"):
+        if key in rec and isinstance(rec[key], str) and rec[key].strip():
+            candidates.append(rec[key].strip())
+
+    # If nothing obvious, try to scan all string values for something SG-like
+    if not candidates:
+        for v in rec.values():
+            if isinstance(v, str) and any(ch in v for ch in ("m", "3", "-")):
+                candidates.append(v)
+
+    for raw in candidates:
+        # take the token before a parenthesis or after colon
+        token = re.split(r"[\(\):,;]| sg | space ?group ", raw, flags=re.I)[0].strip()
+        # if too short, fallback to raw
+        token = token if len(token) >= 2 else raw
+        canon = canonical_spacegroup_symbol(token)
+        if canon:
+            return canon
+    return ""
 
 
 def request_json(
     url: str, headers: Dict[str, str], params: Dict[str, Any], retries: int = 3, backoff: float = 0.8
 ) -> Dict[str, Any] | None:
+    err = None
     for attempt in range(1, retries + 1):
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
-        if resp.status_code == 200:
-            try:
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+            if resp.status_code == 200:
                 return resp.json()
-            except Exception:
-                return None
-        # simple backoff
+            err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+        except Exception as e:
+            err = str(e)
         if attempt < retries:
             time.sleep(backoff * attempt)
-    # final failure
-    sys.stderr.write(f"[WARN] {url} failed with {resp.status_code}: {resp.text[:200]}\n")
+    sys.stderr.write(f"[WARN] {url} failed: {err}\n")
     return None
 
 
@@ -120,33 +156,8 @@ def fetch_by_formula(db_type: str, formulas: List[str], headers: Dict[str, str],
         if not data or "results" not in data:
             continue
         for rec in data["results"]:
+            rec["_db_type"] = db_type
             rec["_query_formula"] = f
-            rec["_db_type"] = db_type
-            out.append(rec)
-    return out
-
-
-def fetch_by_elements(
-    db_type: str, formulas: List[str], headers: Dict[str, str], exact_match: bool, limit: int, sleep_ms: int
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for f in formulas:
-        els = elements_from_formula(f)
-        if not els:
-            continue
-        params = {
-            "elements": ",".join(els),
-            "exact_match": str(bool(exact_match)).lower(),
-            "limit": limit,
-        }
-        data = request_json(f"{BASE_URL}/api/{db_type}/search", headers=headers, params=params)
-        time.sleep(max(0, sleep_ms) / 1000.0)
-        if not data or "results" not in data:
-            continue
-        for rec in data["results"]:
-            rec["_query_elements"] = ",".join(els)
-            rec["_query_formula_hint"] = f
-            rec["_db_type"] = db_type
             out.append(rec)
     return out
 
@@ -154,47 +165,41 @@ def fetch_by_elements(
 def flatten_records(records: List[Dict[str, Any]]) -> pd.DataFrame:
     if not records:
         return pd.DataFrame()
-    # Flatten and normalize keys; keep order-ish
     df = pd.json_normalize(records, sep=".")
-    # common NEMAD fields seen in examples
-    preferred_cols = [
+    # put useful columns first if present
+    preferred = [
         "_db_type",
         "Material_Name",
-        "Curie", "Neel",
-        "Crystal_Structure",
-        "Magnetic_Moment",
         "DOI",
-        "_query_formula", "_query_elements", "_query_formula_hint",
+        "Curie", "Neel",
+        "Magnetic_Moment",
+        "Crystal_Structure",
+        "Space_Group", "SpaceGroup", "space_group",
+        "_query_formula",
     ]
-    # move preferred columns to the front if present
-    front = [c for c in preferred_cols if c in df.columns]
+    front = [c for c in preferred if c in df.columns]
     rest = [c for c in df.columns if c not in front]
     return df[front + rest]
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Fetch NEMAD data and write tidy CSV/JSON; optionally merge with MP CSV.")
-    ap.add_argument("--mp", default="datalist.csv", help="Path to MP classic CSV (default: datalist.csv)")
-    ap.add_argument("--types", nargs="+", default=["magnetic"], help="NEMAD DB types: magnetic, magnetic_anisotropy, thermoelectric, superconductor")
-    ap.add_argument("--by-formula", action="store_true", help="Use formula endpoint instead of element search")
-    ap.add_argument("--exact-match", default="true", choices=["true", "false"], help="For element search: exact element set match")
-    ap.add_argument("--limit", type=int, default=50, help="Max results per query (-1 for all if supported)")
-    ap.add_argument("--sleep-ms", type=int, default=250, help="Delay between API calls (ms) to be nice to the server")
-    ap.add_argument("--retries", type=int, default=3, help="Retries per call")
-    ap.add_argument("--api-key", default=os.getenv("NEMAD_API_KEY", ""), help="NEMAD API key (or set NEMAD_API_KEY env var)")
-    ap.add_argument("--out", default="nemad_results.csv", help="CSV of raw NEMAD results")
-    ap.add_argument("--json", action="store_true", help="Also write JSON dump (nemad_results.json)")
-    ap.add_argument("--parquet", action="store_true", help="Also write Parquet dump (nemad_results.parquet)")
-    ap.add_argument("--merge-out", default="", help="If set, also write merged MP+NEMAD CSV to this path")
+    ap = argparse.ArgumentParser(description="Match NEMAD by formula+spacegroup from datalist.csv, save CSV and per-record JSON.")
+    ap.add_argument("--mp", default="datalist.csv", help="Path to MP CSV (default: datalist.csv)")
+    ap.add_argument("--types", nargs="+", default=["magnetic"], help=f"NEMAD db types (default: magnetic). Options: {', '.join(sorted(VALID_TYPES))}")
+    ap.add_argument("--limit", type=int, default=50, help="Max results per NEMAD query")
+    ap.add_argument("--sleep-ms", type=int, default=250, help="Delay between API calls (ms)")
+    ap.add_argument("--retries", type=int, default=3, help="Retries per API call")
+    ap.add_argument("--api-key", default=os.getenv("NEMAD_API_KEY", ""), help="NEMAD API key (or env NEMAD_API_KEY)")
+    ap.add_argument("--out", default="nemad_matches.csv", help="CSV of matched (formula+SG) NEMAD results")
+    ap.add_argument("--download-dir", default="nemad_raw", help="Directory to save per-record JSON")
     args = ap.parse_args()
 
-    # Validate db types
-    types = []
+    db_types = []
     for t in args.types:
         t = t.strip().lower()
         if t not in VALID_TYPES:
             raise SystemExit(f"Unknown db type '{t}'. Valid: {', '.join(sorted(VALID_TYPES))}")
-        types.append(t)
+        db_types.append(t)
 
     if not args.api_key:
         print("WARNING: NEMAD API key not set. Provide with --api-key or env NEMAD_API_KEY.", file=sys.stderr)
@@ -204,58 +209,65 @@ def main():
         "accept": "application/json",
     }
 
-    # 1) Load MP CSV & compute canonical formula once
-    mp_path = Path(args.mp)
-    mp = read_mp_csv(mp_path)
+    # load MP CSV amd compute canonical fields
+    mp = read_mp_csv(Path(args.mp))
     mp["_formula_canon"] = mp["_mp_formula"].astype(str).map(canonical_formula)
+    mp["_sg_canon"] = mp["_mp_sg"].astype(str).map(canonical_spacegroup_symbol)
+
+    # filter out rows without needed info
+    mp = mp[(mp["_formula_canon"] != "") & (mp["_sg_canon"] != "")]
+    if mp.empty:
+        raise SystemExit("No rows with both a valid formula and space-group symbol found in datalist.csv.")
+
     formulas = sorted(set(mp["_formula_canon"].tolist()))
 
-    # 2) Query NEMAD per formula (or element set)
+    # query NEMAD by formula (In any form)
     all_records: List[Dict[str, Any]] = []
-    for db_type in types:
-        if args.by_formula:
-            recs = fetch_by_formula(db_type, formulas, headers, limit=args.limit, sleep_ms=args.sleep_ms)
-        else:
-            recs = fetch_by_elements(
-                db_type,
-                formulas,
-                headers,
-                exact_match=(args.exact_match.lower() == "true"),
-                limit=args.limit,
-                sleep_ms=args.sleep_ms,
-            )
+    for db_type in db_types:
+        recs = fetch_by_formula(db_type, formulas, headers, limit=args.limit, sleep_ms=args.sleep_ms)
         all_records.extend(recs)
 
-    # 3) Flatten + write results
-    df_nemad = flatten_records(all_records)
+    if not all_records:
+        print("[INFO] No NEMAD results returned for the given formulas.")
+        pd.DataFrame(columns=["_db_type"]).to_csv(args.out, index=False)
+        return
+
+    # also we by the Space-group ....also, keep only those whose SG matches the one from MP for the same formula
+    # biuld MP lookup, formula, set of allowed SGs
+    mp_allowed = (mp.groupby("_formula_canon")["_sg_canon"]
+                    .apply(lambda s: set(s.dropna().tolist()))
+                    .to_dict())
+
+    matched: List[Dict[str, Any]] = []
+    for rec in all_records:
+        f = rec.get("_query_formula", "")
+        sg_rec = extract_sg_symbol_from_nemad(rec)
+        rec["_nemad_sg_canon"] = sg_rec
+        # keep if SG matches any MP SG for that formula
+        if f and sg_rec and sg_rec in mp_allowed.get(f, set()):
+            matched.append(rec)
+
+    # write outputs
+    df_out = flatten_records(matched)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    df_nemad.to_csv(args.out, index=False)
-    print(f"[OK] Wrote NEMAD results -> {args.out}  (rows={len(df_nemad)})")
+    df_out.to_csv(args.out, index=False)
+    print(f"[OK] Wrote matched (formula+SG) results -> {args.out}  (rows={len(df_out)})")
 
-    if args.json:
-        Path("nemad_results.json").write_text(json.dumps(all_records), encoding="utf-8")
-        print("[OK] Wrote nemad_results.json")
+    # download raw JSON per record
+    outdir = Path(args.download_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
-    if args.parquet:
-        try:
-            df_nemad.to_parquet("nemad_results.parquet", index=False)
-            print("[OK] Wrote nemad_results.parquet")
-        except Exception as e:
-            print(f"[WARN] parquet not written: {e}")
+    def safe_name(s: str) -> str:
+        return re.sub(r"[^A-Za-z0-9._+-]+", "_", s)[:200]
 
-    # 4) Optional merge onto MP rows (by canonical formula)
-    if args.merge_out:
-        if df_nemad.empty:
-            print("[INFO] Skipping merge (no NEMAD rows).")
-        else:
-            # add canonical formula to NEMAD side: prefer explicit Material_Name, else the query hint
-            nemad_formula_col = "Material_Name" if "Material_Name" in df_nemad.columns else (
-                "_query_formula" if "_query_formula" in df_nemad.columns else "_query_formula_hint"
-            )
-            df_nemad["_formula_canon"] = df_nemad[nemad_formula_col].astype(str).map(canonical_formula)
-            merged = mp.merge(df_nemad, on="_formula_canon", how="left", suffixes=("_mp", "_nemad"))
-            merged.to_csv(args.merge_out, index=False)
-            print(f"[OK] Wrote merged MP+NEMAD -> {args.merge_out}  (rows={len(merged)})")
+    for i, rec in enumerate(matched, start=1):
+        f = rec.get("_query_formula", "NA")
+        sg = rec.get("_nemad_sg_canon", "NA")
+        dbt = rec.get("_db_type", "NA")
+        fname = safe_name(f"{i:05d}_{dbt}_{f}_{sg}.json")
+        (outdir / fname).write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"[OK] Saved {len(matched)} JSON records in {outdir}")
 
 
 if __name__ == "__main__":
