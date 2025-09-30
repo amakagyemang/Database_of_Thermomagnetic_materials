@@ -105,7 +105,7 @@ python3 utils_plot.py --bands results_band_dos/mp-149_bs.json
 
 * JSON files with raw MP/NEMAD data
 * CSV summary tables (elastic constants, band gaps, etc.)
-* Publication-ready plots (PNG/PDF) for DOS, bands, elastic summaries
+* Publication-ready plots (PNG/PDF) for DOS, bands, and elastic summaries
 
 
  Workflow
@@ -115,9 +115,31 @@ python3 utils_plot.py --bands results_band_dos/mp-149_bs.json
 4. Use `utils_plot.py` to visualize DOS/bands.
 5. Combine all results into screening tables (examples provided in the LaTeX paper).
 
-Citation
-If you use this workflow in your research, please cite the Materials Project and NEMAD databases:
-A. Jain et al., The Materials Project: A materials genome approach to accelerating materials innovation, APL Materials 1, 011002 (2013).
-NEMAD Database: https://nemad.org
-A. Jain *et al.*, **The Materials Project: A materials genome approach to accelerating materials innovation**, *APL Materials* **1**, 011002 (2013).
-  NEMAD Database: [https://nemad.org](https://nemad.org)
+Citations for the Materials Project and NEMAD databases:
+Materials Project:
+
+1. A. Jain*, S.P. Ong*, G. Hautier, W. Chen, W.D. Richards, S. Dacek, S. Cholia, D. Gunter, D. Skinner, G. Ceder, K.A. Persson (*=equal contributions)
+The Materials Project: A materials genome approach to accelerating materials innovation
+APL Materials, 2013, 1(1), 011002.
+doi:10.1063/1.4812323
+
+
+2. Materials API
+S. P. Ong, S. Cholia, A. Jain, M. Brafman, D. Gunter, G. Ceder, and K. A. Persson
+The Materials Application Programming Interface (API): A simple, flexible and efficient API for materials data based on REpresentational State Transfer (REST) principles.
+Computational Materials Science, 2015, 97, 209–215.
+doi:10.1016/j.commatsci.2014.10.037
+
+3. Elastic properties:
+M. de Jong, W. Chen, T. Angsten, A. Jain, R. Notestine, A. Gamst, M. Sluiter, C. K. Ande, S. van der Zwaag, J. J. Plata, C. Toher, S. Curtarolo, G. Ceder, K. A. Persson, M. Asta
+Charting the complete elastic properties of inorganic crystalline compounds
+Scientific Data 2: 150009 (2015).
+doi:10.1038/sdata.2015.9
+
+NEMAD:
+1. Zhang, Y., Itani, S., Khanal, K., Okyere, E., Smith, G., Takahashi, K., & Zang, J. (2024). GPTArticleExtractor: An automated workflow for magnetic material database construction. 
+Journal of Magnetism and Magnetic Materials, 597, 172001.
+
+2. Itani, S., Zhang, Y., & Zang, J. (2024). Northeast materials database (nemad): Enabling discovery of high transition temperature magnetic compounds. arXiv preprint arXiv:2409.15675.
+
+
